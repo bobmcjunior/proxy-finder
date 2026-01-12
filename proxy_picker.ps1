@@ -2,21 +2,83 @@ $HttpList   = "https://github.com/TheSpeedX/PROXY-List/raw/refs/heads/master/htt
 $Socks4List = "https://github.com/TheSpeedX/PROXY-List/raw/refs/heads/master/socks4.txt"
 $Socks5List = "https://github.com/TheSpeedX/PROXY-List/raw/refs/heads/master/socks5.txt"
 
-$Timeout = 6
-$MaxThreads = 80
+$TimeoutSeconds = 3
+$SampleSize = 500
+$MaxRounds = 3
 $TestUrl = "http://example.com"
-
-Write-Host "`n[+] Downloading proxy lists..."
 
 function Download-List($url) {
     try {
-        (Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 20).Content `
-            -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -match ":" }
+        (Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 15).Content `
+            -split "`n" | ForEach-Object { $_.Trim() } |
+            Where-Object { $_ -match "^\d+\.\d+\.\d+\.\d+:\d+$" } | Get-Unique
     } catch {
         Write-Host "[-] Failed to download: $url"
         return @()
     }
 }
+
+function Test-HttpProxy($proxy) {
+    try {
+        $webProxy = New-Object System.Net.WebProxy("http://$proxy")
+        $handler  = New-Object System.Net.Http.HttpClientHandler
+        $handler.Proxy = $webProxy
+        $handler.UseProxy = $true
+
+        $client = New-Object System.Net.Http.HttpClient($handler)
+        $client.Timeout = [TimeSpan]::FromSeconds($TimeoutSeconds)
+
+        $resp = $client.GetAsync($TestUrl).Result
+
+        # Only accept OPEN proxies (200 OK)
+        if ($resp.StatusCode -eq 200) {
+            return $proxy
+        }
+    } catch {}
+    return $null
+}
+
+function Test-SocksProxy($proxy) {
+    try {
+        $parts = $proxy.Split(":")
+        $tcp = New-Object System.Net.Sockets.TcpClient
+        $res = $tcp.BeginConnect($parts[0], [int]$parts[1], $null, $null)
+        $ok = $res.AsyncWaitHandle.WaitOne($TimeoutSeconds * 1000, $false)
+        $tcp.Close()
+        if ($ok) { return $proxy }
+    } catch {}
+    return $null
+}
+
+function Find-OpenProxy($list, $type) {
+    for ($round = 1; $round -le $MaxRounds; $round++) {
+
+        Write-Host "[*] $type round $round/$MaxRounds — sampling $SampleSize proxies..."
+
+        $sample = $list | Get-Random -Count ([Math]::Min($SampleSize, $list.Count))
+        $found = [System.Collections.Concurrent.ConcurrentBag[string]]::new()
+
+        [System.Threading.Tasks.Parallel]::ForEach($sample, { param($p)
+
+            if ($type -eq "HTTP") {
+                $r = Test-HttpProxy $p
+                if ($r) { $found.Add($r) }
+            } else {
+                $r = Test-SocksProxy $p
+                if ($r) { $found.Add($r) }
+            }
+
+        })
+
+        if ($found.Count -gt 0) {
+            return (Get-Random $found)
+        }
+    }
+
+    return $null
+}
+
+Write-Host "`n[+] Downloading proxy lists..."
 
 $httpProxies   = Download-List $HttpList
 $socks4Proxies = Download-List $Socks4List
@@ -26,110 +88,14 @@ Write-Host "[+] HTTP proxies   : $($httpProxies.Count)"
 Write-Host "[+] SOCKS4 proxies : $($socks4Proxies.Count)"
 Write-Host "[+] SOCKS5 proxies : $($socks5Proxies.Count)`n"
 
-function Test-HttpProxy($proxy) {
-    try {
-        $proxyUri = "http://$proxy"
-        $webProxy = New-Object System.Net.WebProxy($proxyUri)
-
-        $handler = New-Object System.Net.Http.HttpClientHandler
-        $handler.Proxy = $webProxy
-        $handler.UseProxy = $true
-
-        $client = New-Object System.Net.Http.HttpClient($handler)
-        $client.Timeout = [TimeSpan]::FromSeconds($Timeout)
-
-        $r = $client.GetAsync($TestUrl).Result
-        if ($r.IsSuccessStatusCode) { return $proxy }
-    } catch {}
-}
-
-function Test-SocksProxy($proxy) {
-    try {
-        $tcp = New-Object System.Net.Sockets.TcpClient
-        $result = $tcp.BeginConnect($proxy.Split(":")[0], $proxy.Split(":")[1], $null, $null)
-        $success = $result.AsyncWaitHandle.WaitOne(3000, $false)
-        $tcp.Close()
-        if ($success) { return $proxy }
-    } catch {}
-}
-
-function Find-Alive($list, $type) {
-    Write-Host "[+] Scanning $type proxies..."
-    $jobs = @()
-    $alive = @()
-
-    foreach ($p in $list | Get-Random -Count ([Math]::Min(800, $list.Count))) {
-        while ($jobs.Count -ge $MaxThreads) {
-            $jobs = $jobs | Where-Object { $_.State -eq "Running" }
-            Start-Sleep -Milliseconds 100
-        }
-
-        $jobs += Start-Job -ScriptBlock {
-            param($proxy, $ptype, $timeout, $url)
-
-            if ($ptype -eq "HTTP") {
-                try {
-                    $proxyUri = "http://$proxy"
-                    $webProxy = New-Object System.Net.WebProxy($proxyUri)
-
-                    $handler = New-Object System.Net.Http.HttpClientHandler
-                    $handler.Proxy = $webProxy
-                    $handler.UseProxy = $true
-
-                    $client = New-Object System.Net.Http.HttpClient($handler)
-                    $client.Timeout = [TimeSpan]::FromSeconds($timeout)
-
-                    $r = $client.GetAsync($url).Result
-                    if ($r.IsSuccessStatusCode) { return $proxy }
-                } catch {}
-            } else {
-                try {
-                    $ip = $proxy.Split(":")[0]
-                    $port = $proxy.Split(":")[1]
-                    $tcp = New-Object System.Net.Sockets.TcpClient
-                    $res = $tcp.BeginConnect($ip, $port, $null, $null)
-                    $ok = $res.AsyncWaitHandle.WaitOne(3000, $false)
-                    $tcp.Close()
-                    if ($ok) { return $proxy }
-                } catch {}
-            }
-        } -ArgumentList $p, $type, $Timeout, $TestUrl
-    }
-
-    foreach ($job in $jobs) {
-        $out = Receive-Job $job -Wait
-        if ($out) { $alive += $out }
-        Remove-Job $job
-    }
-
-    return $alive
-}
-
-$aliveHttp   = Find-Alive $httpProxies "HTTP"
-$aliveSocks4 = Find-Alive $socks4Proxies "SOCKS4"
-$aliveSocks5 = Find-Alive $socks5Proxies "SOCKS5"
+$httpResult   = Find-OpenProxy $httpProxies   "HTTP"
+$socks4Result = Find-OpenProxy $socks4Proxies "SOCKS4"
+$socks5Result = Find-OpenProxy $socks5Proxies "SOCKS5"
 
 Write-Host "`n=============================="
 
-if ($aliveHttp.Count -gt 0) {
-    $pick = Get-Random $aliveHttp
-    Write-Host "✅ HTTP   : $pick"
-} else {
-    Write-Host "❌ HTTP   : None alive"
-}
-
-if ($aliveSocks4.Count -gt 0) {
-    $pick = Get-Random $aliveSocks4
-    Write-Host "✅ SOCKS4 : $pick"
-} else {
-    Write-Host "❌ SOCKS4 : None alive"
-}
-
-if ($aliveSocks5.Count -gt 0) {
-    $pick = Get-Random $aliveSocks5
-    Write-Host "✅ SOCKS5 : $pick"
-} else {
-    Write-Host "❌ SOCKS5 : None alive"
-}
+if ($httpResult)   { Write-Host "✅ HTTP   : $httpResult"   } else { Write-Host "❌ HTTP   : No open proxy found" }
+if ($socks4Result) { Write-Host "✅ SOCKS4 : $socks4Result" } else { Write-Host "❌ SOCKS4 : No open proxy found" }
+if ($socks5Result) { Write-Host "✅ SOCKS5 : $socks5Result" } else { Write-Host "❌ SOCKS5 : No open proxy found" }
 
 Write-Host "=============================="
