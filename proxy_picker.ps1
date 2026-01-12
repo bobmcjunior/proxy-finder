@@ -1,3 +1,4 @@
+# Proxy lists
 $HttpList   = "https://github.com/TheSpeedX/PROXY-List/raw/refs/heads/master/http.txt"
 $Socks4List = "https://github.com/TheSpeedX/PROXY-List/raw/refs/heads/master/socks4.txt"
 $Socks5List = "https://github.com/TheSpeedX/PROXY-List/raw/refs/heads/master/socks5.txt"
@@ -7,6 +8,8 @@ $SampleSize = 500
 $MaxRounds = 3
 $TestUrl = "http://example.com"
 
+# -------------------------
+# Download and clean list
 function Download-List($url) {
     try {
         (Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 15).Content `
@@ -18,6 +21,8 @@ function Download-List($url) {
     }
 }
 
+# -------------------------
+# Test HTTP proxy
 function Test-HttpProxy($proxy) {
     try {
         $webProxy = New-Object System.Net.WebProxy("http://$proxy")
@@ -29,12 +34,13 @@ function Test-HttpProxy($proxy) {
         $client.Timeout = [TimeSpan]::FromSeconds($TimeoutSeconds)
 
         $resp = $client.GetAsync($TestUrl).Result
-
         if ($resp.StatusCode -eq 200) { return $proxy }
     } catch {}
     return $null
 }
 
+# -------------------------
+# Test SOCKS proxy (TCP connect)
 function Test-SocksProxy($proxy) {
     try {
         $parts = $proxy.Split(":")
@@ -47,38 +53,23 @@ function Test-SocksProxy($proxy) {
     return $null
 }
 
+# -------------------------
+# Find an open proxy (any type)
 function Find-OpenProxy($list, $type) {
     for ($round = 1; $round -le $MaxRounds; $round++) {
         Write-Host "[*] $type round $round/$MaxRounds — sampling $SampleSize proxies..."
         $sample = $list | Get-Random -Count ([Math]::Min($SampleSize, $list.Count))
-        $foundProxy = $null
-
-        $sync = New-Object System.Object
-
+        
         foreach ($p in $sample) {
-            [Threading.ThreadPool]::QueueUserWorkItem({
-                param($proxy, $type, $TestUrl, $Timeout, $sync)
-                
-                if ($foundProxy) { return } # stop if already found
-                
-                if ($type -eq "HTTP") { $res = Test-HttpProxy $proxy } else { $res = Test-SocksProxy $proxy }
-
-                if ($res) {
-                    lock($sync) { $script:foundProxy = $res }
-                }
-
-            }, $p, $type, $TestUrl, $TimeoutSeconds, $sync)
+            if ($type -eq "HTTP") { $res = Test-HttpProxy $p } else { $res = Test-SocksProxy $p }
+            if ($res) { return $res } # stop immediately once an open proxy is found
         }
-
-        # Wait until either found or all threads finish
-        $maxWait = $TimeoutSeconds * $SampleSize * 1.1
-        $stopwatch = [Diagnostics.Stopwatch]::StartNew()
-        while (-not $foundProxy -and $stopwatch.Elapsed.TotalSeconds -lt $maxWait) { Start-Sleep -Milliseconds 50 }
-
-        if ($foundProxy) { return $foundProxy }
     }
     return $null
 }
+
+# -------------------------
+# Main
 
 Write-Host "`n[+] Downloading proxy lists..."
 $httpProxies   = Download-List $HttpList
