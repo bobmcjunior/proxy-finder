@@ -30,10 +30,7 @@ function Test-HttpProxy($proxy) {
 
         $resp = $client.GetAsync($TestUrl).Result
 
-        # Only accept OPEN proxies (200 OK)
-        if ($resp.StatusCode -eq 200) {
-            return $proxy
-        }
+        if ($resp.StatusCode -eq 200) { return $proxy }
     } catch {}
     return $null
 }
@@ -52,34 +49,38 @@ function Test-SocksProxy($proxy) {
 
 function Find-OpenProxy($list, $type) {
     for ($round = 1; $round -le $MaxRounds; $round++) {
-
         Write-Host "[*] $type round $round/$MaxRounds — sampling $SampleSize proxies..."
-
         $sample = $list | Get-Random -Count ([Math]::Min($SampleSize, $list.Count))
-        $found = [System.Collections.Concurrent.ConcurrentBag[string]]::new()
+        $foundProxy = $null
 
-        [System.Threading.Tasks.Parallel]::ForEach($sample, { param($p)
+        $sync = New-Object System.Object
 
-            if ($type -eq "HTTP") {
-                $r = Test-HttpProxy $p
-                if ($r) { $found.Add($r) }
-            } else {
-                $r = Test-SocksProxy $p
-                if ($r) { $found.Add($r) }
-            }
+        foreach ($p in $sample) {
+            [Threading.ThreadPool]::QueueUserWorkItem({
+                param($proxy, $type, $TestUrl, $Timeout, $sync)
+                
+                if ($foundProxy) { return } # stop if already found
+                
+                if ($type -eq "HTTP") { $res = Test-HttpProxy $proxy } else { $res = Test-SocksProxy $proxy }
 
-        })
+                if ($res) {
+                    lock($sync) { $script:foundProxy = $res }
+                }
 
-        if ($found.Count -gt 0) {
-            return (Get-Random $found)
+            }, $p, $type, $TestUrl, $TimeoutSeconds, $sync)
         }
-    }
 
+        # Wait until either found or all threads finish
+        $maxWait = $TimeoutSeconds * $SampleSize * 1.1
+        $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+        while (-not $foundProxy -and $stopwatch.Elapsed.TotalSeconds -lt $maxWait) { Start-Sleep -Milliseconds 50 }
+
+        if ($foundProxy) { return $foundProxy }
+    }
     return $null
 }
 
 Write-Host "`n[+] Downloading proxy lists..."
-
 $httpProxies   = Download-List $HttpList
 $socks4Proxies = Download-List $Socks4List
 $socks5Proxies = Download-List $Socks5List
@@ -93,9 +94,7 @@ $socks4Result = Find-OpenProxy $socks4Proxies "SOCKS4"
 $socks5Result = Find-OpenProxy $socks5Proxies "SOCKS5"
 
 Write-Host "`n=============================="
-
 if ($httpResult)   { Write-Host "✅ HTTP   : $httpResult"   } else { Write-Host "❌ HTTP   : No open proxy found" }
 if ($socks4Result) { Write-Host "✅ SOCKS4 : $socks4Result" } else { Write-Host "❌ SOCKS4 : No open proxy found" }
 if ($socks5Result) { Write-Host "✅ SOCKS5 : $socks5Result" } else { Write-Host "❌ SOCKS5 : No open proxy found" }
-
 Write-Host "=============================="
