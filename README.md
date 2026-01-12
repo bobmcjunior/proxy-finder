@@ -1,6 +1,6 @@
 # proxy-finder
 Finds a random "living" proxy and outputs it in terminal.
-Use:
+
 powershell -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/proxy_picker.ps1 -UseBasicParsing | iex"
 
 
